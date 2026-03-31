@@ -1,73 +1,82 @@
-# React + TypeScript + Vite
+# Performant dashboard (telemetry test)
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A small **React + Vite** dashboard that visualizes **10,000** simulated drones at high frame rates. Telemetry arrives as **binary WebSocket** frames, is copied into a **`SharedArrayBuffer`** by a **Web Worker** (no per-field parsing on the hot path), and is rendered with **Deck.gl** (orthographic grid + scatter plot).
 
-Currently, two official plugins are available:
+## Architecture (short)
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+| Piece | Role |
+|--------|------|
+| **`server.js`** | Node **WebSocket** server (~60 Hz) + **HTTP admin** API. Emits raw snapshots that match `src/telemetryConstants.ts`. |
+| **`telemetryWorker.ts`** | `Uint8Array#set` from each WS frame into the SAB—bulk copy, endianness matches the wire format. |
+| **`App.tsx`** | Owns the `SharedArrayBuffer`; wires worker + UI. |
+| **`DeckMap.tsx`** | **Deck.gl** map: `PathLayer` grid + `ScatterplotLayer` subclass that disables fp64 for Cartesian positions; reads telemetry via accessors + `updateTriggers` when the SAB updates. |
+| **`Sidebar.tsx`** | Reads selected slot from the SAB for debugging / actions. |
 
-## React Compiler
+**Wire format:** fixed **20 bytes** per drone × 10k instances (`RECORD_BYTES`, `INSTANCE_COUNT` in `telemetryConstants.ts`). Layout is shared by `server.js` and the client.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Ports
 
-## Expanding the ESLint configuration
+| Port | Service |
+|------|---------|
+| **8080** | WebSocket telemetry (`ws://127.0.0.1:8080`) |
+| **8081** | Drone **admin HTTP** (mission, offline/relaunch/kill, etc.) |
+| **Vite** | Dev server (default **5173** unless configured) |
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+## Quick start
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+`npm run dev` runs **Vite** and, if port **8080** is free, **spawns `server.js`** so you usually do **not** need a second terminal. If something is already bound to 8080, start the server yourself: `npm run dev:server`.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+- Open the URL Vite prints (e.g. `http://localhost:5173`).
+- The header should show **`Telemetry WS: open`** when the client connects.
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+**Two-terminal workflow** (optional):
+
+```bash
+# Terminal 1
+npm run dev:server
+
+# Terminal 2
+npm run dev:client
 ```
+
+### Environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `VITE_WS_URL` | WebSocket URL (default `ws://127.0.0.1:8080`). |
+| `VITE_ADMIN_URL` | Admin API base (default `http://127.0.0.1:8081`). |
+| `SKIP_TELEMETRY_SERVER` | Set to `1` or `true` to stop Vite from auto-spawning `server.js` (see `vite.config.ts`). |
+
+## Scripts
+
+| Script | Description |
+|--------|-------------|
+| `npm run dev` | Vite dev server (+ auto telemetry server when port 8080 is free). |
+| `npm run dev:server` | Node telemetry + admin API only. |
+| `npm run dev:client` | Vite only. |
+| `npm run build` | `tsc -b` then production Vite build. |
+| `npm run preview` | Serve the production build locally. |
+| `npm run lint` | ESLint. |
+
+`postinstall` runs **`patch-package`** (see `patches/`).
+
+## Tech stack
+
+- **React 19**, **TypeScript**, **Vite 8**
+- **Deck.gl 9** / **luma.gl** (WebGL; WebGPU-oriented stack in v9)
+- **`ws`** (Node WebSocket server)
+
+## Troubleshooting
+
+- **`Telemetry WS` stuck on connecting / closed** — Ensure `server.js` is running and **8080** matches `VITE_WS_URL`. Prefer **`127.0.0.1`** over `localhost` if IPv4/IPv6 mismatches appear.
+- **Port 8080 in use** — Another process may hold it (including a stray Node after Ctrl+C on Windows). Free the port or set `SKIP_TELEMETRY_SERVER=1` and run `npm run dev:server` manually.
+- **No dots on the map** — Requires an open WS and non-empty SAB; the map uses accessor-based positions and a small **`telemetryFrame`** tick so Deck.gl refreshes after in-place SAB writes.
+
+## License
+
+Private project (`"private": true` in `package.json`).
