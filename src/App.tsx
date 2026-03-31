@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import DeckMap from './DeckMap'
 import Sidebar from './Sidebar'
 import { SAB_BYTES } from './telemetryConstants'
-import type { WsStatusMsg } from './telemetryWorker'
+import type { WorkerToMainMsg, WsStatusMsg } from './telemetryWorker'
 
 const adminBase = () => import.meta.env.VITE_ADMIN_URL ?? 'http://127.0.0.1:8081'
 
@@ -11,8 +11,12 @@ export default function App() {
   const [selectedRecordIndex, setSelectedRecordIndex] = useState<number | null>(null)
   const [selectingMissionTarget, setSelectingMissionTarget] = useState(false)
   const [wsStatus, setWsStatus] = useState<WsStatusMsg['status']>('connecting')
+  const [telemetryRevision, setTelemetryRevision] = useState(0)
 
   const sharedBuffer = useMemo(() => new SharedArrayBuffer(SAB_BYTES), [])
+
+  const telemetryRevRef = useRef(0)
+  const telemetryRafScheduledRef = useRef(false)
 
   const onSelectDrone = useCallback((id: number, index: number) => {
     setSelectedDroneId(id)
@@ -43,9 +47,22 @@ export default function App() {
     const url = import.meta.env.VITE_WS_URL ?? 'ws://127.0.0.1:8080'
 
     const worker = new Worker(new URL('./telemetryWorker.ts', import.meta.url), { type: 'module' })
-    worker.onmessage = (e: MessageEvent<WsStatusMsg>) => {
+    worker.onmessage = (e: MessageEvent<WorkerToMainMsg>) => {
       const d = e.data
-      if (d?.type === 'ws-status') setWsStatus(d.status)
+      if (d.type === 'ws-status') {
+        setWsStatus(d.status)
+        return
+      }
+      if (d.type === 'telemetry-frame') {
+        telemetryRevRef.current = (telemetryRevRef.current + 1) & 0xfffffff
+        if (!telemetryRafScheduledRef.current) {
+          telemetryRafScheduledRef.current = true
+          requestAnimationFrame(() => {
+            telemetryRafScheduledRef.current = false
+            setTelemetryRevision(telemetryRevRef.current)
+          })
+        }
+      }
     }
     worker.postMessage({ type: 'init', url, buffer: sharedBuffer })
 
@@ -73,6 +90,7 @@ export default function App() {
       <div style={{ display: 'flex', flex: 1, minHeight: 0, overflow: 'hidden' }}>
         <DeckMap
           sharedBuffer={sharedBuffer}
+          telemetryRevision={telemetryRevision}
           onSelectDrone={onSelectDrone}
           selectedRecordIndex={selectedRecordIndex}
           missionTargetMode={selectingMissionTarget}

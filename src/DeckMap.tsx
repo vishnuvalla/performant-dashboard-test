@@ -1,21 +1,18 @@
-import { useMemo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useMemo, useCallback, useLayoutEffect, useRef, useState } from 'react'
 import DeckGL from '@deck.gl/react'
 import type { DeckGLRef } from '@deck.gl/react'
 import { PathLayer, ScatterplotLayer } from '@deck.gl/layers'
 import { COORDINATE_SYSTEM, OrthographicView } from '@deck.gl/core'
-import type { OrthographicViewState, PickingInfo } from '@deck.gl/core'
-import {
-  DRONE_FLAG_OFFLINE,
-  INSTANCE_COUNT,
-  OFF_FLAGS,
-  OFF_ID,
-  OFF_X,
-  OFF_Y,
-  RECORD_BYTES,
-} from './telemetryConstants'
+import type { Color, OrthographicViewState, PickingInfo, Position } from '@deck.gl/core'
+import { DRONE_FLAG_OFFLINE, INSTANCE_COUNT, RECORD_BYTES } from './telemetryConstants'
+
+/** Floats per interleaved record (`RECORD_BYTES / 4`). */
+const STRIDE_FLOATS = RECORD_BYTES / 4
 
 export type DeckMapProps = {
   sharedBuffer: SharedArrayBuffer
+  /** Bumps when the worker copies a new telemetry frame into the SAB (coalesced to one React update per animation frame). */
+  telemetryRevision: number
   onSelectDrone: (droneId: number, recordIndex: number) => void
   selectedRecordIndex: number | null
   /** When true, the next map click sets a mission target (world xy) instead of selecting a drone. */
@@ -39,10 +36,11 @@ function fitOrthographicZoom(minViewportPx: number): number {
 }
 
 /**
- * `FastScatterplotLayer` disables fp64 for positions (v9 removed the `fp64` prop). Runtime logs showed buffer + viewport
- * were correct while binary `data.attributes.getPosition` still drew nothing; accessor `getPosition` with z=0 matches the
- * grid plane and renders reliably. Binary positions on this 20-byte layout remain fragile with deck’s fp64 attribute
- * plumbing even when `use64bitPositions` is false.
+ * `FastScatterplotLayer` disables fp64 for positions (v9 removed the `fp64` prop). We intentionally avoid binary
+ * `data.attributes.getPosition` here: that path regressed to **no visible dots** despite valid buffer + projection
+ * (deck/luma attribute upload). Accessors use shared `Float32Array` / `Uint32Array` views over the SAB (no per-index
+ * `DataView`) and Deck’s `target` scratch arrays where supported to cut allocations. Colors/radius still need JS
+ * (flags are not RGBA; selection is React state).
  */
 class FastScatterplotLayer extends ScatterplotLayer {
   static override layerName = 'FastScatterplotLayer'
@@ -54,6 +52,7 @@ class FastScatterplotLayer extends ScatterplotLayer {
 
 export default function DeckMap({
   sharedBuffer,
+  telemetryRevision,
   onSelectDrone,
   selectedRecordIndex,
   missionTargetMode = false,
@@ -61,7 +60,6 @@ export default function DeckMap({
 }: DeckMapProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const deckRef = useRef<DeckGLRef>(null)
-  const [telemetryFrame, setTelemetryFrame] = useState(0)
   const [viewState, setViewState] = useState<OrthographicViewState>({
     target: [0, 0, 0],
     zoom: fitOrthographicZoom(600),
@@ -70,6 +68,14 @@ export default function DeckMap({
   })
   const [deckPx, setDeckPx] = useState({ w: 0, h: 0 })
   const didFitZoomRef = useRef(false)
+
+  const sabViews = useMemo(
+    () => ({
+      f32: new Float32Array(sharedBuffer),
+      u32: new Uint32Array(sharedBuffer),
+    }),
+    [sharedBuffer],
+  )
 
   const gridPaths = useMemo(() => {
     const out: { path: [number, number, number][] }[] = []
@@ -113,16 +119,6 @@ export default function DeckMap({
     return () => ro.disconnect()
   }, [])
 
-  useEffect(() => {
-    let raf = 0
-    const loop = () => {
-      setTelemetryFrame((n) => (n + 1) & 0xfffffff)
-      raf = requestAnimationFrame(loop)
-    }
-    raf = requestAnimationFrame(loop)
-    return () => cancelAnimationFrame(raf)
-  }, [])
-
   const layers = useMemo(
     () => [
       new PathLayer({
@@ -140,10 +136,13 @@ export default function DeckMap({
         id: 'drone-layer',
         coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
         data: { length: INSTANCE_COUNT },
-        getPosition: (_d, { index }) => {
-          const o = index * RECORD_BYTES
-          const dv = new DataView(sharedBuffer, o, RECORD_BYTES)
-          return [dv.getFloat32(OFF_X, true), dv.getFloat32(OFF_Y, true), 0]
+        getPosition: (_d, { index, target }) => {
+          const b = index * STRIDE_FLOATS
+          const { f32 } = sabViews
+          target[0] = f32[b + 1]
+          target[1] = f32[b + 2]
+          target[2] = 0
+          return target as unknown as Position
         },
         parameters: {
           depthWriteEnabled: false,
@@ -153,34 +152,58 @@ export default function DeckMap({
         radiusMinPixels: 0,
         radiusMaxPixels: 5,
         getRadius: (_d, { index }) => {
-          const id = new DataView(sharedBuffer, index * RECORD_BYTES + OFF_ID, 4).getUint32(0, true)
+          const id = sabViews.u32[index * STRIDE_FLOATS + 0]
           if (id === 0) return 0
           const selected = selectedRecordIndex !== null && index === selectedRecordIndex
           return selected ? 5 : 3
         },
-        getFillColor: (_d, { index }) => {
-          const base = index * RECORD_BYTES
-          const dv = new DataView(sharedBuffer, base, RECORD_BYTES)
-          const id = dv.getUint32(OFF_ID, true)
-          if (id === 0) return [0, 0, 0, 0]
-          const flags = dv.getUint32(OFF_FLAGS, true)
+        getFillColor: (_d, { index, target }) => {
+          const id = sabViews.u32[index * STRIDE_FLOATS + 0]
+          if (id === 0) {
+            target[0] = 0
+            target[1] = 0
+            target[2] = 0
+            target[3] = 0
+            return target as unknown as Color
+          }
+          const flags = sabViews.u32[index * STRIDE_FLOATS + 4]
           const offline = (flags & DRONE_FLAG_OFFLINE) !== 0
           const selected = selectedRecordIndex !== null && index === selectedRecordIndex
           if (selected) {
-            return offline ? [255, 180, 100, 191] : [255, 200, 80, 242]
+            if (offline) {
+              target[0] = 255
+              target[1] = 180
+              target[2] = 100
+              target[3] = 191
+            } else {
+              target[0] = 255
+              target[1] = 200
+              target[2] = 80
+              target[3] = 242
+            }
+          } else if (offline) {
+            target[0] = 140
+            target[1] = 150
+            target[2] = 160
+            target[3] = 115
+          } else {
+            target[0] = 80
+            target[1] = 200
+            target[2] = 255
+            target[3] = 191
           }
-          return offline ? [140, 150, 160, 115] : [80, 200, 255, 191]
+          return target as unknown as Color
         },
         stroked: false,
         pickable: true,
         updateTriggers: {
-          getPosition: [telemetryFrame],
-          getRadius: [telemetryFrame, selectedRecordIndex],
-          getFillColor: [telemetryFrame, selectedRecordIndex],
+          getPosition: [telemetryRevision],
+          getRadius: [telemetryRevision, selectedRecordIndex],
+          getFillColor: [telemetryRevision, selectedRecordIndex],
         },
       }),
     ],
-    [gridPaths, sharedBuffer, selectedRecordIndex, telemetryFrame],
+    [gridPaths, sabViews, selectedRecordIndex, telemetryRevision],
   )
 
   const handleDeckClick = useCallback(
@@ -201,13 +224,13 @@ export default function DeckMap({
       }
 
       if (info.layer?.id === 'drone-layer' && typeof info.index === 'number' && info.index >= 0) {
-        const id = new DataView(sharedBuffer, info.index * RECORD_BYTES + OFF_ID, 4).getUint32(0, true)
+        const id = sabViews.u32[info.index * STRIDE_FLOATS + 0]
         if (id !== 0) {
           onSelectDrone(id, info.index)
         }
       }
     },
-    [sharedBuffer, onSelectDrone, missionTargetMode, onMissionTarget],
+    [sabViews.u32, onSelectDrone, missionTargetMode, onMissionTarget],
   )
 
   return (

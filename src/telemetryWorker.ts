@@ -7,6 +7,11 @@ export type WsStatusMsg = {
   status: 'connecting' | 'open' | 'closed' | 'error'
 }
 
+/** Posted after each full-frame copy into the SAB so the map can refresh without a main-thread rAF spin loop. */
+export type TelemetryFrameMsg = { type: 'telemetry-frame' }
+
+export type WorkerToMainMsg = WsStatusMsg | TelemetryFrameMsg
+
 self.onmessage = (ev: MessageEvent<InitMsg>) => {
   const msg = ev.data
   if (msg.type !== 'init') return
@@ -42,6 +47,8 @@ self.onmessage = (ev: MessageEvent<InitMsg>) => {
       // (2) The main thread + GPU read the same interleaved layout; the worker only moves bytes.
       // Endianness matches the server (little-endian) byte-for-byte.
       u8.set(new Uint8Array(data))
+      const tick: TelemetryFrameMsg = { type: 'telemetry-frame' }
+      self.postMessage(tick)
     }
 
     ws.onerror = () => {
