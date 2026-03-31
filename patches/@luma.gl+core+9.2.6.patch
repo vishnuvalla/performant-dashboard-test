@@ -1,0 +1,56 @@
+diff --git a/node_modules/@luma.gl/core/dist/adapter/canvas-context.js b/node_modules/@luma.gl/core/dist/adapter/canvas-context.js
+index d4436e1..45b224d 100644
+--- a/node_modules/@luma.gl/core/dist/adapter/canvas-context.js
++++ b/node_modules/@luma.gl/core/dist/adapter/canvas-context.js
+@@ -166,7 +166,13 @@ export class CanvasContext {
+     }
+     /** Returns the biggest allowed framebuffer size. @todo Allow the application to limit this? */
+     getMaxDrawingBufferSize() {
+-        const maxTextureDimension = this.device.limits.maxTextureDimension2D;
++        // Guard: WebGLCanvasContext assigns `device` after CanvasContext `super()`; ResizeObserver
++        // can fire synchronously during `observe()` before `this.device.limits` exists (luma v9.2).
++        const limits = this.device?.limits;
++        if (!limits) {
++            return [8192, 8192];
++        }
++        const maxTextureDimension = limits.maxTextureDimension2D;
+         return [maxTextureDimension, maxTextureDimension];
+     }
+     /** Update the canvas drawing buffer size. Called automatically if props.autoResize is true. */
+@@ -251,6 +257,9 @@ export class CanvasContext {
+         if (!entry) {
+             return;
+         }
++        if (!this.device?.limits) {
++            return;
++        }
+         // Update CSS size using content box size
+         this.cssWidth = entry.contentBoxSize[0].inlineSize;
+         this.cssHeight = entry.contentBoxSize[0].blockSize;
+diff --git a/node_modules/@luma.gl/core/dist/dist.dev.js b/node_modules/@luma.gl/core/dist/dist.dev.js
+index 2a00954..5b1e540 100644
+--- a/node_modules/@luma.gl/core/dist/dist.dev.js
++++ b/node_modules/@luma.gl/core/dist/dist.dev.js
+@@ -2041,7 +2041,11 @@ or create a device with the 'debug: true' prop.`;
+     }
+     /** Returns the biggest allowed framebuffer size. @todo Allow the application to limit this? */
+     getMaxDrawingBufferSize() {
+-      const maxTextureDimension = this.device.limits.maxTextureDimension2D;
++      const limits = this.device?.limits;
++      if (!limits) {
++        return [8192, 8192];
++      }
++      const maxTextureDimension = limits.maxTextureDimension2D;
+       return [maxTextureDimension, maxTextureDimension];
+     }
+     /** Update the canvas drawing buffer size. Called automatically if props.autoResize is true. */
+@@ -2124,6 +2128,9 @@ or create a device with the 'debug: true' prop.`;
+       if (!entry) {
+         return;
+       }
++      if (!this.device?.limits) {
++        return;
++      }
+       this.cssWidth = entry.contentBoxSize[0].inlineSize;
+       this.cssHeight = entry.contentBoxSize[0].blockSize;
+       const oldPixelSize = this.getDevicePixelSize();
