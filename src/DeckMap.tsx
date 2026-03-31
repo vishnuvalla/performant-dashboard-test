@@ -1,14 +1,17 @@
 import { useMemo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import DeckGL from '@deck.gl/react'
 import type { DeckGLRef } from '@deck.gl/react'
-import { PathLayer } from '@deck.gl/layers'
+import { PathLayer, ScatterplotLayer } from '@deck.gl/layers'
 import { COORDINATE_SYSTEM, OrthographicView } from '@deck.gl/core'
 import type { OrthographicViewState, PickingInfo } from '@deck.gl/core'
 import {
   DRONE_FLAG_OFFLINE,
   INSTANCE_COUNT,
+  OFF_FLAGS,
+  OFF_ID,
+  OFF_X,
+  OFF_Y,
   RECORD_BYTES,
-  SAB_BYTES,
 } from './telemetryConstants'
 
 export type DeckMapProps = {
@@ -36,16 +39,11 @@ function fitOrthographicZoom(minViewportPx: number): number {
 }
 
 /**
- * PathLayer grid (WebGL) + Canvas 2D dots projected with the same viewport as Deck.
- * ScatterplotLayer binary/fp64 paths failed to draw reliably; overlay uses viewport.project() for parity with the grid.
+ * PathLayer grid + ScatterplotLayer: positions use `getPosition` (not binary attributes on the interleaved SAB).
+ * Deck’s fp64 path lays out `instancePositions64Low` 12 bytes after xyz — same offset as our `OFF_FLAGS` (byte 16).
+ * Binary `getPosition` on that buffer therefore fed flags/next-id bytes as “low” components; accessors read x,y and
+ * force z=0 so depth matches the grid plane. `telemetryFrame` still invalidates positions when the worker mutates SAB.
  */
-const DOT_COLOR = 'rgba(80,200,255,0.75)'
-const OFFLINE_DOT_COLOR = 'rgba(140,150,160,0.45)'
-const SELECTED_DOT_COLOR = 'rgba(255,200,80,0.95)'
-const SELECTED_OFFLINE_DOT_COLOR = 'rgba(255,180,100,0.75)'
-
-const STRIDE_U32 = RECORD_BYTES / 4
-
 export default function DeckMap({
   sharedBuffer,
   onSelectDrone,
@@ -55,7 +53,7 @@ export default function DeckMap({
 }: DeckMapProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const deckRef = useRef<DeckGLRef>(null)
-  const overlayRef = useRef<HTMLCanvasElement>(null)
+  const [telemetryFrame, setTelemetryFrame] = useState(0)
   const [viewState, setViewState] = useState<OrthographicViewState>({
     target: [0, 0, 0],
     zoom: fitOrthographicZoom(600),
@@ -64,16 +62,6 @@ export default function DeckMap({
   })
   const [deckPx, setDeckPx] = useState({ w: 0, h: 0 })
   const didFitZoomRef = useRef(false)
-
-  const positionStrideView = useMemo(
-    () => new Float32Array(sharedBuffer, 0, SAB_BYTES / 4),
-    [sharedBuffer],
-  )
-
-  const u32StrideView = useMemo(
-    () => new Uint32Array(sharedBuffer, 0, SAB_BYTES / 4),
-    [sharedBuffer],
-  )
 
   const gridPaths = useMemo(() => {
     const out: { path: [number, number, number][] }[] = []
@@ -120,50 +108,12 @@ export default function DeckMap({
   useEffect(() => {
     let raf = 0
     const loop = () => {
-      const deck = deckRef.current?.deck
-      const canvas = overlayRef.current
-      // Deck.getViewports() asserts viewManager — null until first Deck render completes.
-      if (deck?.isInitialized && canvas && deckPx.w > 0 && deckPx.h > 0) {
-        canvas.width = deckPx.w
-        canvas.height = deckPx.h
-        const vps = deck.getViewports()
-        const vp = vps[0]
-        if (vp) {
-            const ctx = canvas.getContext('2d')
-          if (ctx) {
-            ctx.clearRect(0, 0, canvas.width, canvas.height)
-            const f32 = positionStrideView
-            const u32 = u32StrideView
-            for (let i = 0; i < INSTANCE_COUNT; i++) {
-              const base = i * STRIDE_U32
-              const id = u32[base + 0]
-              if (id === 0) continue
-              const flags = u32[base + 4]
-              const offline = (flags & DRONE_FLAG_OFFLINE) !== 0
-              const wx = f32[base + 1]
-              const wy = f32[base + 2]
-              const p = vp.project([wx, wy, 0])
-              const px = p[0]
-              const py = p[1]
-              if (px >= -4 && px <= canvas.width + 4 && py >= -4 && py <= canvas.height + 4) {
-                const selected = selectedRecordIndex !== null && i === selectedRecordIndex
-                if (selected) {
-                  ctx.fillStyle = offline ? SELECTED_OFFLINE_DOT_COLOR : SELECTED_DOT_COLOR
-                } else {
-                  ctx.fillStyle = offline ? OFFLINE_DOT_COLOR : DOT_COLOR
-                }
-                const half = selected ? 2.5 : 1.5
-                ctx.fillRect(px - half, py - half, half * 2, half * 2)
-              }
-            }
-          }
-        }
-      }
+      setTelemetryFrame((n) => (n + 1) & 0xfffffff)
       raf = requestAnimationFrame(loop)
     }
     raf = requestAnimationFrame(loop)
     return () => cancelAnimationFrame(raf)
-  }, [positionStrideView, u32StrideView, deckPx.w, deckPx.h, selectedRecordIndex])
+  }, [])
 
   const layers = useMemo(
     () => [
@@ -178,8 +128,55 @@ export default function DeckMap({
         capRounded: true,
         pickable: false,
       }),
+      new ScatterplotLayer({
+        id: 'drone-layer',
+        coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
+        data: { length: INSTANCE_COUNT },
+        getPosition: (_d, { index }) => {
+          const o = index * RECORD_BYTES
+          const dv = new DataView(sharedBuffer, o, RECORD_BYTES)
+          return [
+            dv.getFloat32(OFF_X, true),
+            dv.getFloat32(OFF_Y, true),
+            0,
+          ]
+        },
+        parameters: {
+          depthWriteEnabled: false,
+          depthCompare: 'always',
+        },
+        radiusUnits: 'pixels',
+        radiusMinPixels: 0,
+        radiusMaxPixels: 5,
+        getRadius: (_d, { index }) => {
+          const id = new DataView(sharedBuffer, index * RECORD_BYTES + OFF_ID, 4).getUint32(0, true)
+          if (id === 0) return 0
+          const selected = selectedRecordIndex !== null && index === selectedRecordIndex
+          return selected ? 5 : 3
+        },
+        getFillColor: (_d, { index }) => {
+          const base = index * RECORD_BYTES
+          const dv = new DataView(sharedBuffer, base, RECORD_BYTES)
+          const id = dv.getUint32(OFF_ID, true)
+          if (id === 0) return [0, 0, 0, 0]
+          const flags = dv.getUint32(OFF_FLAGS, true)
+          const offline = (flags & DRONE_FLAG_OFFLINE) !== 0
+          const selected = selectedRecordIndex !== null && index === selectedRecordIndex
+          if (selected) {
+            return offline ? [255, 180, 100, 191] : [255, 200, 80, 242]
+          }
+          return offline ? [140, 150, 160, 115] : [80, 200, 255, 191]
+        },
+        stroked: false,
+        pickable: true,
+        updateTriggers: {
+          getPosition: [telemetryFrame],
+          getRadius: [telemetryFrame, selectedRecordIndex],
+          getFillColor: [telemetryFrame, selectedRecordIndex],
+        },
+      }),
     ],
-    [gridPaths],
+    [gridPaths, sharedBuffer, selectedRecordIndex, telemetryFrame],
   )
 
   const handleDeckClick = useCallback(
@@ -199,38 +196,14 @@ export default function DeckMap({
         return
       }
 
-      let best = -1
-      let bestD = 144
-      const f32 = positionStrideView
-      const u32 = u32StrideView
-      for (let i = 0; i < INSTANCE_COUNT; i++) {
-        const base = i * STRIDE_U32
-        if (u32[base + 0] === 0) continue
-        const wx = f32[base + 1]
-        const wy = f32[base + 2]
-        const p = vp.project([wx, wy, 0])
-        const dx = p[0] - x
-        const dy = p[1] - y
-        const d = dx * dx + dy * dy
-        if (d < bestD) {
-          bestD = d
-          best = i
+      if (info.layer?.id === 'drone-layer' && typeof info.index === 'number' && info.index >= 0) {
+        const id = new DataView(sharedBuffer, info.index * RECORD_BYTES + OFF_ID, 4).getUint32(0, true)
+        if (id !== 0) {
+          onSelectDrone(id, info.index)
         }
       }
-      if (best >= 0) {
-        const dv = new DataView(sharedBuffer)
-        const id = dv.getUint32(best * RECORD_BYTES, true)
-        onSelectDrone(id, best)
-      }
     },
-    [
-      positionStrideView,
-      u32StrideView,
-      sharedBuffer,
-      onSelectDrone,
-      missionTargetMode,
-      onMissionTarget,
-    ],
+    [sharedBuffer, onSelectDrone, missionTargetMode, onMissionTarget],
   )
 
   return (
@@ -275,18 +248,6 @@ export default function DeckMap({
         controller
         style={{ width: '100%', height: '100%' }}
         onClick={handleDeckClick}
-      />
-      <canvas
-        ref={overlayRef}
-        style={{
-          position: 'absolute',
-          left: 0,
-          top: 0,
-          zIndex: 1,
-          width: deckPx.w > 0 ? deckPx.w : '100%',
-          height: deckPx.h > 0 ? deckPx.h : '100%',
-          pointerEvents: 'none',
-        }}
       />
     </div>
   )
