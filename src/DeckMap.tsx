@@ -39,11 +39,19 @@ function fitOrthographicZoom(minViewportPx: number): number {
 }
 
 /**
- * PathLayer grid + ScatterplotLayer: positions use `getPosition` (not binary attributes on the interleaved SAB).
- * Deck’s fp64 path lays out `instancePositions64Low` 12 bytes after xyz — same offset as our `OFF_FLAGS` (byte 16).
- * Binary `getPosition` on that buffer therefore fed flags/next-id bytes as “low” components; accessors read x,y and
- * force z=0 so depth matches the grid plane. `telemetryFrame` still invalidates positions when the worker mutates SAB.
+ * `FastScatterplotLayer` disables fp64 for positions (v9 removed the `fp64` prop). Runtime logs showed buffer + viewport
+ * were correct while binary `data.attributes.getPosition` still drew nothing; accessor `getPosition` with z=0 matches the
+ * grid plane and renders reliably. Binary positions on this 20-byte layout remain fragile with deck’s fp64 attribute
+ * plumbing even when `use64bitPositions` is false.
  */
+class FastScatterplotLayer extends ScatterplotLayer {
+  static override layerName = 'FastScatterplotLayer'
+
+  override use64bitPositions(): boolean {
+    return false
+  }
+}
+
 export default function DeckMap({
   sharedBuffer,
   onSelectDrone,
@@ -128,18 +136,14 @@ export default function DeckMap({
         capRounded: true,
         pickable: false,
       }),
-      new ScatterplotLayer({
+      new FastScatterplotLayer({
         id: 'drone-layer',
         coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
         data: { length: INSTANCE_COUNT },
         getPosition: (_d, { index }) => {
           const o = index * RECORD_BYTES
           const dv = new DataView(sharedBuffer, o, RECORD_BYTES)
-          return [
-            dv.getFloat32(OFF_X, true),
-            dv.getFloat32(OFF_Y, true),
-            0,
-          ]
+          return [dv.getFloat32(OFF_X, true), dv.getFloat32(OFF_Y, true), 0]
         },
         parameters: {
           depthWriteEnabled: false,
